@@ -12,7 +12,54 @@ const VoiceResponse = require('twilio').twiml.VoiceResponse;
 // Set up Express with WebSocket support
 const app = express();
 ExpressWs(app);
+
+// Add these middleware lines
+app.use(express.json());  // Parse JSON bodies
+app.use(express.urlencoded({ extended: true }));  // Parse URL-encoded bodies
+
 const PORT = process.env.PORT || 3000;
+
+// Route for outbound calls from Make.com
+app.post('/outgoing-call', async (req, res) => {
+    const { firstMessage, number } = req.body;
+    console.log(`Initiating outbound call to ${number} with message: ${firstMessage}`);
+
+    try {
+        const accountSid = process.env.TWILIO_ACCOUNT_SID;
+        const authToken = process.env.TWILIO_AUTH_TOKEN;
+        const client = require('twilio')(accountSid, authToken);
+
+        const call = await client.calls.create({
+            from: process.env.FROM_NUMBER,
+            to: number,
+            url: `https://${req.headers.host}/outgoing-call-twiml?firstMessage=${encodeURIComponent(firstMessage)}&number=${encodeURIComponent(number)}`
+        });
+
+        res.send({ message: 'Call initiated', callSid: call.sid });
+    } catch (error) {
+        console.error('Error initiating outbound call:', error);
+        res.status(500).send({ error: 'Failed to initiate call' });
+    }
+});
+
+// TwiML for outgoing calls
+app.all('/outgoing-call-twiml', async (req, res) => {
+    const firstMessage = req.query.firstMessage || 'Hi, how are you?';
+    const number = req.query.number || 'Unknown';
+    console.log(`First Message: ${firstMessage}`);
+
+    const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
+                            <Response>
+                              <Connect>
+                                  <Stream url="wss://${req.headers.host}/connection">
+                                      <Parameter name="firstMessage" value="${firstMessage}" />
+                                      <Parameter name="callerNumber" value="${number}" />
+                                  </Stream>
+                              </Connect>
+                          </Response>`;
+
+    res.type('text/xml').send(twimlResponse);
+});
 
 // Handle incoming calls from Twilio
 app.post('/incoming', (req, res) => {
@@ -51,11 +98,31 @@ app.ws('/connection', (ws) => {
        // Call started - set up IDs and send welcome message
        streamSid = msg.start.streamSid;
        callSid = msg.start.callSid;
-       streamService.setStreamSid(streamSid);
-       gptService.setCallSid(callSid);
-       console.log(`Twilio -> Starting Media Stream for ${streamSid}`.underline.red);
-       ttsService.generate({partialResponseIndex: null, partialResponse: 'Welcome to Bart\'s Automotive. • How can I help you today?'}, 0);
-     } 
+
+         // Get custom parameters
+         const firstMessage = msg.start.customParameters?.firstMessage;
+         const callerNumber = msg.start.customParameters?.callerNumber;
+
+         console.log('Call started:', { streamSid, callSid, firstMessage, callerNumber });
+
+         streamService.setStreamSid(streamSid);
+         gptService.setCallSid(callSid);
+
+         if (firstMessage) {
+             // For outbound calls, use the provided first message
+             console.log('Initiating conversation with:', firstMessage);
+             gptService.completion(firstMessage, interactionCount);
+             interactionCount++;
+         } else {
+             // For inbound calls, use the welcome message
+             console.log(`Twilio -> Starting Media Stream for ${streamSid}`.underline.red);
+             ttsService.generate({
+                 partialResponseIndex: null, 
+                 partialResponse: 'Welcome to Bart\'s Automotive. • How can I help you today?'
+             }, 0);
+         }
+    }
+         
      else if (msg.event === 'media') {
        // Received audio from caller - send to transcription
        transcriptionService.send(msg.media.payload);
